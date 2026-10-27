@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LEGO Motor Control (LWP3)</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:12px}
+button{font-size:16px;padding:8px 12px;margin:2px;border-radius:6px;border:0;cursor:pointer}
+#connect{background:#2a7;color:#fff}#stopall{background:#d22;color:#fff;font-size:28px;width:100%;padding:18px;margin:10px 0}
+.port{background:#222;border-radius:8px;padding:10px;margin:8px 0}
+input[type=range]{width:100%}#log{background:#000;color:#7f7;font:12px monospace;height:220px;overflow:auto;white-space:pre;padding:6px}
+.muted{color:#999;font-size:13px}
+</style></head><body>
+<h2>LEGO Motor Control <span class="muted">(LEGO Wireless Protocol 3.0)</span></h2>
+<button id="connect">Connect hub</button> <button id="disconnect">Disconnect</button>
+<span id="status">Not connected</span> | Battery: <b id="battery">–</b>
+<button id="stopall">STOP ALL (Space)</button>
+<div class="muted">Keys: Space = stop all · 1–4 select port (A–D) · ↑/↓ speed ±10 · F float · B brake · Z set zero</div>
+<div id="ports"></div>
+<h3>Log (raw hex)</h3><div id="log"></div>
+<script>
+/* ===== LWP3 constants (https://lego.github.io/lego-ble-wireless-protocol-docs/) ===== */
+const SERVICE = '00001623-1212-efde-1623-785feabcd123';
+const CHAR    = '00001624-1212-efde-1623-785feabcd123';
+const MSG = { HUB_PROP:0x01, ATTACHED_IO:0x04, ERROR:0x05, PORT_INPUT_FMT_SINGLE:0x41,
+              PORT_VALUE_SINGLE:0x45, PORT_OUTPUT_CMD:0x81, PORT_OUTPUT_FEEDBACK:0x82 };
+const SUB = { START_SPEED:0x07, GOTO_ABS_POS:0x0D, WRITE_DIRECT_MODE:0x51 };
+const END = { FLOAT:0, HOLD:126, BRAKE:127 };   // end states / special speed values
+const STARTUP_COMPLETION = 0x11;                // execute immediately + command feedback
+const MOTOR_TYPES = { 0x01:'Simple motor',0x02:'Train motor',0x26:'Medium motor',0x27:'Move hub motor',
+  0x2E:'Technic L motor',0x2F:'Technic XL motor',0x30:'SPIKE M motor',0x31:'SPIKE L motor',
+  0x41:'SPIKE S motor',0x4B:'Technic M angular (grey)',0x4C:'Technic L angular (grey)' };
+const TACHO = new Set([0x26,0x27,0x2E,0x2F,0x30,0x31,0x41,0x4B,0x4C]); // have POS mode 2
+
+let char = null, device = null, selected = null;
+const ports = {};   // portId -> {type, speed, el}
+const $ = id => document.getElementById(id);
+const hex = a => [...a].map(b=>b.toString(16).padStart(2,'0')).join(' ');
+const portName = p => p<4 ? 'ABCD'[p] : '0x'+p.toString(16);
+function log(s){ const l=$('log'); l.textContent += s+'\n'; l.scrollTop=l.scrollHeight; }
+
+/* ===== Sending: every message = [length, hubId(0), type, ...payload] ===== */
+let queue = Promise.resolve();
+function send(type, payload){
+  const msg = new Uint8Array([payload.length+3, 0x00, type, ...payload]);
+  queue = queue.then(async()=>{ if(!char) return; log('TX '+hex(msg)); await char.writeValueWithoutResponse(msg); })
+               .catch(e=>log('TX error '+e));
+  return queue;
+}
+const int32 = v => { const b=new Uint8Array(4); new DataView(b.buffer).setInt32(0,v,true); return [...b]; };
+const s8 = v => (v & 0xFF);
+
+/* ===== Motor commands (Port Output Command 0x81) ===== */
+const startSpeed = (port, speed, maxPower=100) =>        // speed -100..100, 0=float, 127=brake
+  send(MSG.PORT_OUTPUT_CMD,[port,STARTUP_COMPLETION,SUB.START_SPEED,s8(speed),maxPower,0]);
+const gotoAbs = (port, deg, speed=50, maxPower=100, end=END.HOLD) =>
+  send(MSG.PORT_OUTPUT_CMD,[port,STARTUP_COMPLETION,SUB.GOTO_ABS_POS,...int32(deg),s8(speed),maxPower,end,0]);
+const presetEncoder = (port, deg=0) =>                   // WriteDirectModeData, mode 2 = position
+  send(MSG.PORT_OUTPUT_CMD,[port,STARTUP_COMPLETION,SUB.WRITE_DIRECT_MODE,0x02,...int32(deg)]);
+const subscribePos = port =>                             // Port Input Format Setup: mode 2, delta 1, notify on
+  send(MSG.PORT_INPUT_FMT_SINGLE,[port,0x02,1,0,0,0,1]);
+const subscribeBattery = () => send(MSG.HUB_PROP,[0x06,0x02]); // property 6 = battery %, op 2 = enable updates
+
+function stopAll(){ for(const p in ports){ startSpeed(+p, END.BRAKE); setSlider(+p,0);} }
+
+/* ===== Receiving ===== */
+function onNotify(e){
+  const d = new Uint8Array(e.target.value.buffer); log('RX '+hex(d));
+  const dv = new DataView(d.buffer); const type = d[2];
+  if(type===MSG.HUB_PROP && d[3]===0x06 && d[4]===0x06) $('battery').textContent = d[5]+'%';
+  else if(type===MSG.ATTACHED_IO){
+    const port=d[3], ev=d[4];
+    if(ev===0) removePort(port); else addPort(port, dv.getUint16(5,true));
+  }
+  else if(type===MSG.PORT_VALUE_SINGLE && ports[d[3]] && d.length>=8)
+    ports[d[3]].el.querySelector('.pos').textContent = dv.getInt32(4,true)+'°';
+  else if(type===MSG.ERROR) log('   ^ hub error for command 0x'+d[3].toString(16)+' code '+d[4]);
+}
+
+/* ===== UI per port ===== */
+function addPort(port, type){
+  removePort(port);
+  const name = MOTOR_TYPES[type] || ('device type 0x'+type.toString(16));
+  const el = document.createElement('div'); el.className='port';
+  const isMotor = type in MOTOR_TYPES;
+  el.innerHTML = `<b>Port ${portName(port)}</b> – ${name} ${isMotor?'· position: <b class="pos">–</b>':''}`+
+   (isMotor?`<div>Speed <b class="sv">0</b><input type="range" min="-100" max="100" value="0" class="sp"></div>
+   <button class="fl">Float</button><button class="br">Brake</button>
+   ${TACHO.has(type)?`<input type="number" class="deg" value="0" style="width:80px"> ° <button class="go">Go to angle</button>
+   <button class="zero">Set zero</button>`:''}`:'');
+  $('ports').appendChild(el); ports[port]={type,el};
+  if(!isMotor) return;
+  const sp=el.querySelector('.sp');
+  sp.oninput=()=>{ el.querySelector('.sv').textContent=sp.value; startSpeed(port,+sp.value); selected=port; };
+  el.querySelector('.fl').onclick=()=>{ setSlider(port,0); startSpeed(port,END.FLOAT); };
+  el.querySelector('.br').onclick=()=>{ setSlider(port,0); startSpeed(port,END.BRAKE); };
+  if(TACHO.has(type)){
+    el.querySelector('.go').onclick=()=>gotoAbs(port,+el.querySelector('.deg').value);
+    el.querySelector('.zero').onclick=()=>presetEncoder(port,0);
+    subscribePos(port);
+  }
+  if(selected===null) selected=port;
+}
+function removePort(p){ if(ports[p]){ ports[p].el.remove(); delete ports[p]; } }
+function setSlider(p,v){ const s=ports[p]?.el.querySelector('.sp'); if(s){ s.value=v; ports[p].el.querySelector('.sv').textContent=v; } }
+
+/* ===== Connect ===== */
+$('connect').onclick = async()=>{
+  try{
+    device = await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}]});
+    device.addEventListener('gattserverdisconnected',()=>{ $('status').textContent='Disconnected'; char=null; });
+    const server = await device.gatt.connect();
+    char = await (await server.getPrimaryService(SERVICE)).getCharacteristic(CHAR);
+    char.addEventListener('characteristicvaluechanged', onNotify);
+    await char.startNotifications();          // hub now sends Attached I/O for every port
+    $('status').textContent='Connected: '+(device.name||'hub');
+    subscribeBattery();
+  }catch(e){ log('Connect error: '+e); }
+};
+$('disconnect').onclick=()=>{ stopAll(); setTimeout(()=>device?.gatt.disconnect(),300); };
+$('stopall').onclick=stopAll;
+if(!navigator.bluetooth) $('status').textContent='Web Bluetooth not supported – use Chrome or Edge';
+
+/* ===== Keyboard ===== */
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT' && e.target.type==='number') return;
+  const k=e.key.toLowerCase();
+  if(k===' '){ e.preventDefault(); stopAll(); return; }
+  if('1234'.includes(k) && ports[+k-1]){ selected=+k-1; return; }
+  if(selected===null || !ports[selected]) return;
+  const s=ports[selected].el.querySelector('.sp'); if(!s) return;
+  if(k==='arrowup'||k==='arrowdown'){ e.preventDefault(); s.value=+s.value+(k==='arrowup'?10:-10); s.oninput(); }
+  if(k==='f') ports[selected].el.querySelector('.fl').click();
+  if(k==='b') ports[selected].el.querySelector('.br').click();
+  if(k==='z') ports[selected].el.querySelector('.zero')?.click();
+});
+</script></body></html>
